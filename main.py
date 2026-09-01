@@ -7,7 +7,12 @@ linguagem o que já validamos em Python":
 1. Classroom OAuth broker — o client_secret do Google Cloud fica só aqui.
    Quem consome (skill, app) nunca vê o secret, só recebe/usa um
    refresh_token próprio.
-2. Moodle proxy genérico — repassa qualquer wsfunction pro
+2. Calendar OAuth broker — mesmo modelo do Classroom (mesmo client OAuth,
+   escopo diferente): cada pessoa loga com a própria conta Google e recebe
+   o próprio refresh_token. Todo evento criado/lido/apagado é no calendário
+   de quem está chamando, nunca num calendário fixo — não existe conceito de
+   "dono" da API aqui, só de quem tá autenticado em cada chamada.
+3. Moodle proxy genérico — repassa qualquer wsfunction pro
    webservice/rest/server.php de um Moodle (site_url + wstoken vêm de quem
    chama; este serviço não guarda token de ninguém). Existe só pra
    centralizar a lógica de request/erro num lugar só, reusável por qualquer
@@ -38,6 +43,12 @@ CLASSROOM_SCOPES = " ".join([
     "https://www.googleapis.com/auth/classroom.topics.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
 ])
+CALENDAR_SCOPES = "https://www.googleapis.com/auth/calendar"
+CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3"
+
+# Mesmo client OAuth reusado pros dois (GOOGLE_CLASSROOM_CLIENT_ID/SECRET,
+# nome histórico do Classroom, mas é o client Google geral — só troca o
+# escopo pedido em cada fluxo).
 
 
 def _env(name):
@@ -47,42 +58,27 @@ def _env(name):
     return value
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
-# Classroom OAuth broker
-# ---------------------------------------------------------------------------
-
-@app.get("/classroom/oauth/start")
-def classroom_oauth_start():
-    """Redireciona pro consentimento do Google. redirect_uri é sempre este
-    próprio serviço (/classroom/oauth/callback) — precisa estar cadastrado
-    no Google Cloud Console como URI de redirecionamento autorizado."""
+def _oauth_start(scope, redirect_path):
     client_id = _env("GOOGLE_CLASSROOM_CLIENT_ID")
-    redirect_uri = _env("PUBLIC_BASE_URL") + "/classroom/oauth/callback"
+    redirect_uri = _env("PUBLIC_BASE_URL") + redirect_path
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": CLASSROOM_SCOPES,
+        "scope": scope,
         "access_type": "offline",
         "prompt": "consent",
     }
-    url = httpx.URL(GOOGLE_AUTH_URL, params=params)
-    return RedirectResponse(str(url))
+    return RedirectResponse(str(httpx.URL(GOOGLE_AUTH_URL, params=params)))
 
 
-@app.get("/classroom/oauth/callback")
-def classroom_oauth_callback(code: str | None = None, error: str | None = None):
+def _oauth_callback(code, error, redirect_path, env_var_name):
     if error or not code:
         return HTMLResponse(f"<h2>Erro na autorização: {error or 'sem code'}</h2>", status_code=400)
 
     client_id = _env("GOOGLE_CLASSROOM_CLIENT_ID")
     client_secret = _env("GOOGLE_CLASSROOM_CLIENT_SECRET")
-    redirect_uri = _env("PUBLIC_BASE_URL") + "/classroom/oauth/callback"
+    redirect_uri = _env("PUBLIC_BASE_URL") + redirect_path
 
     resp = httpx.post(GOOGLE_TOKEN_URL, data={
         "code": code,
@@ -108,10 +104,46 @@ def classroom_oauth_callback(code: str | None = None, error: str | None = None):
     return HTMLResponse(f"""
         <h2>Autorizado. Copie este valor pro seu .env local:</h2>
         <pre style="font-size:14px;background:#eee;padding:12px;user-select:all">
-CLASSROOM_REFRESH_TOKEN={refresh_token}
+{env_var_name}={refresh_token}
         </pre>
         <p>Pode fechar esta aba depois de copiar.</p>
     """)
+
+
+def _oauth_refresh(refresh_token):
+    client_id = _env("GOOGLE_CLASSROOM_CLIENT_ID")
+    client_secret = _env("GOOGLE_CLASSROOM_CLIENT_SECRET")
+    resp = httpx.post(GOOGLE_TOKEN_URL, data={
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    })
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Falha ao renovar token: {resp.text}")
+    return resp.json()["access_token"]
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Classroom OAuth broker
+# ---------------------------------------------------------------------------
+
+@app.get("/classroom/oauth/start")
+def classroom_oauth_start():
+    """Redireciona pro consentimento do Google. redirect_uri é sempre este
+    próprio serviço (/classroom/oauth/callback) — precisa estar cadastrado
+    no Google Cloud Console como URI de redirecionamento autorizado."""
+    return _oauth_start(CLASSROOM_SCOPES, "/classroom/oauth/callback")
+
+
+@app.get("/classroom/oauth/callback")
+def classroom_oauth_callback(code: str | None = None, error: str | None = None):
+    return _oauth_callback(code, error, "/classroom/oauth/callback", "CLASSROOM_REFRESH_TOKEN")
 
 
 class RefreshRequest(BaseModel):
@@ -122,18 +154,80 @@ class RefreshRequest(BaseModel):
 def classroom_token(body: RefreshRequest):
     """Troca um refresh_token (de qualquer aluno, obtido via /oauth/start)
     por um access_token de curta duração. O secret nunca sai do servidor."""
-    client_id = _env("GOOGLE_CLASSROOM_CLIENT_ID")
-    client_secret = _env("GOOGLE_CLASSROOM_CLIENT_SECRET")
+    return {"access_token": _oauth_refresh(body.refresh_token)}
 
-    resp = httpx.post(GOOGLE_TOKEN_URL, data={
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": body.refresh_token,
-        "grant_type": "refresh_token",
-    })
+
+# ---------------------------------------------------------------------------
+# Calendar OAuth broker — mesmo modelo do Classroom acima. Cada evento
+# criado/lido/apagado é sempre no calendário de quem está autenticado
+# (o access_token passado em cada chamada), nunca num calendário fixo.
+# ---------------------------------------------------------------------------
+
+@app.get("/calendar/oauth/start")
+def calendar_oauth_start():
+    return _oauth_start(CALENDAR_SCOPES, "/calendar/oauth/callback")
+
+
+@app.get("/calendar/oauth/callback")
+def calendar_oauth_callback(code: str | None = None, error: str | None = None):
+    return _oauth_callback(code, error, "/calendar/oauth/callback", "GOOGLE_REFRESH_TOKEN")
+
+
+@app.post("/calendar/token")
+def calendar_token(body: RefreshRequest):
+    return {"access_token": _oauth_refresh(body.refresh_token)}
+
+
+@app.get("/calendar/events")
+def calendar_list_events(access_token: str, calendar_id: str = "primary", max_results: int = 20):
+    resp = httpx.get(
+        f"{CALENDAR_API_BASE}/calendars/{calendar_id}/events",
+        params={"maxResults": max_results, "singleEvents": "true", "orderBy": "startTime"},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
     if resp.status_code != 200:
-        raise HTTPException(502, f"Falha ao renovar token: {resp.text}")
-    return {"access_token": resp.json()["access_token"]}
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+class CreateEventRequest(BaseModel):
+    access_token: str
+    calendar_id: str = "primary"
+    summary: str
+    start: str  # RFC3339, ex: "2026-09-01T09:00:00-03:00"
+    end: str
+    description: str | None = None
+
+
+@app.post("/calendar/events")
+def calendar_create_event(body: CreateEventRequest):
+    payload = {
+        "summary": body.summary,
+        "start": {"dateTime": body.start},
+        "end": {"dateTime": body.end},
+    }
+    if body.description:
+        payload["description"] = body.description
+
+    resp = httpx.post(
+        f"{CALENDAR_API_BASE}/calendars/{body.calendar_id}/events",
+        json=payload,
+        headers={"Authorization": f"Bearer {body.access_token}"},
+    )
+    if resp.status_code not in (200, 201):
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.delete("/calendar/events/{calendar_id}/{event_id}")
+def calendar_delete_event(calendar_id: str, event_id: str, access_token: str):
+    resp = httpx.delete(
+        f"{CALENDAR_API_BASE}/calendars/{calendar_id}/events/{event_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if resp.status_code not in (200, 204):
+        raise HTTPException(resp.status_code, resp.text)
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------------------
