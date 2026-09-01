@@ -22,7 +22,7 @@ import os
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 app = FastAPI(title="ufba-integrations-api")
@@ -168,3 +168,22 @@ def moodle_call(body: MoodleCallRequest):
     if isinstance(result, dict) and "exception" in result:
         raise HTTPException(400, result)
     return result
+
+
+@app.get("/moodle/download")
+def moodle_download(fileurl: str, wstoken: str):
+    """Repassa o binário de um arquivo do Moodle (fileurl vem de dentro do
+    retorno de core_course_get_contents/mod_assign_get_assignments — não é
+    um id arbitrário, é a URL completa do arquivo específico). Sem ganho de
+    segurança em existir (o wstoken já é da própria pessoa, ela podia baixar
+    direto) — só evita duplicar "concatena token=" em outro cliente/linguagem."""
+    sep = "&" if "?" in fileurl else "?"
+    url = f"{fileurl}{sep}token={wstoken}"
+    resp = httpx.get(url, timeout=60, follow_redirects=True)
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Erro HTTP do Moodle ({resp.status_code}) baixando arquivo")
+
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+    )
