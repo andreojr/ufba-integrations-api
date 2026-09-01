@@ -231,6 +231,91 @@ def calendar_delete_event(calendar_id: str, event_id: str, access_token: str):
 
 
 # ---------------------------------------------------------------------------
+# Classroom API proxy genérico — mesmo espírito do /moodle/call, mas a
+# Classroom API é REST (method + path), não um wsfunction único, então o
+# formato do corpo é diferente. access_token vem de quem chama (via
+# /classroom/token) — nunca guardado aqui.
+# ---------------------------------------------------------------------------
+
+CLASSROOM_API_BASE = "https://classroom.googleapis.com/v1"
+DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+
+
+class ClassroomCallRequest(BaseModel):
+    access_token: str
+    method: str = "GET"
+    path: str  # ex: "/courses/{id}/courseWork" — relativo a CLASSROOM_API_BASE
+    params: dict = {}
+    paginate_key: str | None = None  # ex: "courseWork" — junta todas as páginas nesse campo
+
+
+@app.post("/classroom/call")
+def classroom_call(body: ClassroomCallRequest):
+    """Repassa uma chamada REST pra Classroom API. Se paginate_key for
+    passado, segue nextPageToken automaticamente e junta tudo num array só
+    (mesmo comportamento do paginate() que existia em classroom.py)."""
+    headers = {"Authorization": f"Bearer {body.access_token}"}
+    url = CLASSROOM_API_BASE + body.path
+
+    if not body.paginate_key:
+        resp = httpx.request(body.method, url, params=body.params, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, resp.text)
+        return resp.json() if resp.content else {}
+
+    items = []
+    params = dict(body.params)
+    while True:
+        resp = httpx.request(body.method, url, params=params, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, resp.text)
+        page = resp.json()
+        items.extend(page.get(body.paginate_key, []))
+        next_token = page.get("nextPageToken")
+        if not next_token:
+            break
+        params["pageToken"] = next_token
+    return {body.paginate_key: items}
+
+
+@app.get("/classroom/drive-file")
+def classroom_drive_file_metadata(access_token: str, file_id: str):
+    """Metadados de um arquivo do Drive anexado a um coursework (nome,
+    mimeType, modifiedTime) — usado pra decidir se precisa rebaixar."""
+    resp = httpx.get(
+        f"{DRIVE_API_BASE}/files/{file_id}",
+        params={"fields": "id,name,mimeType,modifiedTime"},
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.get("/classroom/drive-download")
+def classroom_drive_download(access_token: str, file_id: str, export_mime: str | None = None):
+    """Baixa o binário de um anexo do Drive. Google Docs/Slides/Sheets
+    nativos não têm bytes 'crus' — passe export_mime (ex: application/pdf)
+    pra usar o endpoint de export em vez de alt=media."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if export_mime:
+        url = f"{DRIVE_API_BASE}/files/{file_id}/export"
+        params = {"mimeType": export_mime}
+    else:
+        url = f"{DRIVE_API_BASE}/files/{file_id}"
+        params = {"alt": "media"}
+
+    resp = httpx.get(url, params=params, headers=headers, timeout=60)
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Erro baixando do Drive: {resp.text}")
+    return Response(
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Moodle proxy genérico
 # ---------------------------------------------------------------------------
 
