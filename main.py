@@ -58,7 +58,7 @@ def _env(name):
     return value
 
 
-def _oauth_start(scope, redirect_path):
+def _oauth_start(scope, redirect_path, state=None):
     client_id = _env("GOOGLE_CLASSROOM_CLIENT_ID")
     redirect_uri = _env("PUBLIC_BASE_URL") + redirect_path
     params = {
@@ -69,10 +69,12 @@ def _oauth_start(scope, redirect_path):
         "access_type": "offline",
         "prompt": "consent",
     }
+    if state:
+        params["state"] = state
     return RedirectResponse(str(httpx.URL(GOOGLE_AUTH_URL, params=params)))
 
 
-def _oauth_callback(code, error, redirect_path, env_var_name):
+def _oauth_callback(code, error, redirect_path, env_var_name, state=None):
     if error or not code:
         return HTMLResponse(f"<h2>Erro na autorização: {error or 'sem code'}</h2>", status_code=400)
 
@@ -99,8 +101,40 @@ def _oauth_callback(code, error, redirect_path, env_var_name):
             status_code=502,
         )
 
-    # Mostra na tela pra copiar — este serviço não guarda o token em lugar
-    # nenhum, é passado direto pra quem está logando.
+    # Se veio um state "local:<porta>", quem chamou /oauth/start está rodando
+    # localmente e subiu um listener nessa porta pra receber o token sozinho
+    # (ver skill renovar-token-calendar) — nesse caso a página faz o POST
+    # automático via JS em vez de exigir copiar e colar. O client_secret nunca
+    # passa por aqui, só o refresh_token final.
+    local_port = None
+    if state and state.startswith("local:"):
+        candidate = state[len("local:"):]
+        if candidate.isdigit():
+            local_port = int(candidate)
+
+    if local_port and 1 <= local_port <= 65535:
+        return HTMLResponse(f"""
+            <h2 id="status">Autorizado. Enviando o token pro seu Claude Code local...</h2>
+            <pre style="font-size:14px;background:#eee;padding:12px;user-select:all">
+{env_var_name}={refresh_token}
+            </pre>
+            <script>
+              fetch("http://localhost:{local_port}/token", {{
+                method: "POST",
+                headers: {{"Content-Type": "application/json"}},
+                body: JSON.stringify({{env_var_name: "{env_var_name}", refresh_token: "{refresh_token}"}}),
+              }}).then(() => {{
+                document.getElementById("status").textContent = "Token entregue. Pode fechar esta aba.";
+              }}).catch(() => {{
+                document.getElementById("status").textContent =
+                  "Não consegui entregar automaticamente (listener local não respondeu) — copie o valor acima à mão.";
+              }});
+            </script>
+        """)
+
+    # Sem listener local (ex: sessão cloud) — mostra na tela pra copiar. Este
+    # serviço não guarda o token em lugar nenhum, é passado direto pra quem
+    # está logando.
     return HTMLResponse(f"""
         <h2>Autorizado. Copie este valor pro seu .env local:</h2>
         <pre style="font-size:14px;background:#eee;padding:12px;user-select:all">
@@ -164,13 +198,14 @@ def classroom_token(body: RefreshRequest):
 # ---------------------------------------------------------------------------
 
 @app.get("/calendar/oauth/start")
-def calendar_oauth_start():
-    return _oauth_start(CALENDAR_SCOPES, "/calendar/oauth/callback")
+def calendar_oauth_start(local_port: int | None = None):
+    state = f"local:{local_port}" if local_port else None
+    return _oauth_start(CALENDAR_SCOPES, "/calendar/oauth/callback", state=state)
 
 
 @app.get("/calendar/oauth/callback")
-def calendar_oauth_callback(code: str | None = None, error: str | None = None):
-    return _oauth_callback(code, error, "/calendar/oauth/callback", "GOOGLE_REFRESH_TOKEN")
+def calendar_oauth_callback(code: str | None = None, error: str | None = None, state: str | None = None):
+    return _oauth_callback(code, error, "/calendar/oauth/callback", "GOOGLE_REFRESH_TOKEN", state=state)
 
 
 @app.post("/calendar/token")
