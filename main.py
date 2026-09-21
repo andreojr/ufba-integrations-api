@@ -168,16 +168,21 @@ def health():
 # ---------------------------------------------------------------------------
 
 @app.get("/classroom/oauth/start")
-def classroom_oauth_start():
+def classroom_oauth_start(local_port: int | None = None):
     """Redireciona pro consentimento do Google. redirect_uri é sempre este
     próprio serviço (/classroom/oauth/callback) — precisa estar cadastrado
-    no Google Cloud Console como URI de redirecionamento autorizado."""
-    return _oauth_start(CLASSROOM_SCOPES, "/classroom/oauth/callback")
+    no Google Cloud Console como URI de redirecionamento autorizado.
+
+    local_port opcional: quando quem chama está rodando um listener local
+    (ver auto_renovar.py da skill renovar-token-classroom), a página final
+    entrega o refresh_token via POST em vez de pedir copiar/colar."""
+    state = f"local:{local_port}" if local_port else None
+    return _oauth_start(CLASSROOM_SCOPES, "/classroom/oauth/callback", state=state)
 
 
 @app.get("/classroom/oauth/callback")
-def classroom_oauth_callback(code: str | None = None, error: str | None = None):
-    return _oauth_callback(code, error, "/classroom/oauth/callback", "CLASSROOM_REFRESH_TOKEN")
+def classroom_oauth_callback(code: str | None = None, error: str | None = None, state: str | None = None):
+    return _oauth_callback(code, error, "/classroom/oauth/callback", "CLASSROOM_REFRESH_TOKEN", state=state)
 
 
 class RefreshRequest(BaseModel):
